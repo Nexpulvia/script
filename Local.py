@@ -7,7 +7,7 @@ import queue
 import subprocess
 import ctypes
 import shutil
-import urllib.request
+import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -154,27 +154,46 @@ class Handler(BaseHTTPRequestHandler):
         if self.store.is_restricted(name):
             self._send(403, b"Domain is restricted")
             return
+
         root = (DOMAINS_DIR / name).resolve()
-        path = self.path.split("?", 1)[0].split("#", 1)[0]
-        path = urllib.request.url2pathname(path)
-        if path in ("", "/"):
-            path = "/index.html"
-        target = (root / path.lstrip("/")).resolve()
+
+        raw_path = self.path.split("?", 1)[0].split("#", 1)[0]
         try:
-            target.relative_to(root)
-        except ValueError:
+            raw_path = urllib.parse.unquote(raw_path)
+        except Exception:
+            self._send(400, b"Bad request")
+            return
+
+        if raw_path in ("", "/"):
+            raw_path = "/index.html"
+
+        parts = [p for p in raw_path.split("/") if p not in ("", ".")]
+        if any(p == ".." for p in parts):
             self._send(403, b"Forbidden")
             return
+
+        target = root.joinpath(*parts)
+
         if target.is_dir():
             target = target / "index.html"
+
+        try:
+            target = target.resolve()
+            target.relative_to(root)
+        except (ValueError, OSError):
+            self._send(403, b"Forbidden")
+            return
+
         if not target.is_file():
             self._send(404, b"Not found")
             return
+
         try:
             data = target.read_bytes()
         except OSError:
             self._send(500, b"Read error")
             return
+
         ctype = self._guess_type(target)
         self.send_response(200)
         self.send_header("Content-Type", ctype)
