@@ -1,70 +1,79 @@
-
 import struct
 import zlib
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from pathlib import Path
 
-S = b"\x89PNG\r\n\x1a\n"
-M = b"PyPicture:Python:"
+PNG_SIG = b"\x89PNG\r\n\x1a\n"
+MARKER = b"PyPicture:Python:"
+
+
+def iter_chunks(data):
+    """Yield (offset, type, payload) for each PNG chunk, stopping at IEND."""
+    i = 8
+    while i + 12 <= len(data):
+        n = struct.unpack(">I", data[i:i+4])[0]
+        kind = data[i+4:i+8]
+        payload = data[i+8:i+8+n]
+        if len(payload) != n:
+            return
+        yield i, kind, payload
+        if kind == b"IEND":
+            return
+        i += n + 12
+
 
 def embed():
-    a = filedialog.askopenfilename(filetypes=[("PNG", "*.png")])
-    if not a:
+    png_path = filedialog.askopenfilename(filetypes=[("PNG", "*.png")])
+    if not png_path:
         return
-    b = filedialog.askopenfilename(filetypes=[("Python", "*.py")])
-    if not b:
+    script_path = filedialog.askopenfilename(filetypes=[("Python", "*.py")])
+    if not script_path:
         return
-    d = Path(a).read_bytes()
-    if not d.startswith(S):
+
+    data = Path(png_path).read_bytes()
+    if not data.startswith(PNG_SIG):
         messagebox.showerror("Error", "Invalid PNG")
         return
-    p = M + zlib.compress(Path(b).read_bytes())
-    c = struct.pack(">I", len(p)) + b"tEXt" + p
-    c += struct.pack(">I", zlib.crc32(b"tEXt" + p) & 0xffffffff)
-    i = 8
-    while i + 12 <= len(d):
-        n = struct.unpack(">I", d[i:i+4])[0]
-        if d[i+4:i+8] == b"IEND":
-            break
-        i += n + 12
-    o = Path(a).with_name(Path(a).stem + "_embedded.png")
-    o.write_bytes(d[:i] + c + d[i:])
-    messagebox.showinfo("PyPicture", f"Saved: {o.name}")
 
-def extract(f):
-    d = Path(f).read_bytes()
-    if not d.startswith(S):
+    payload = MARKER + zlib.compress(Path(script_path).read_bytes())
+    chunk = struct.pack(">I", len(payload)) + b"tEXt" + payload
+    chunk += struct.pack(">I", zlib.crc32(b"tEXt" + payload) & 0xffffffff)
+
+    for offset, kind, _ in iter_chunks(data):
+        if kind == b"IEND":
+            break
+
+    out = Path(png_path).with_name(Path(png_path).stem + "_embedded.png")
+    out.write_bytes(data[:offset] + chunk + data[offset:])
+    messagebox.showinfo("PyPicture", f"Saved: {out.name}")
+
+
+def extract(path):
+    data = Path(path).read_bytes()
+    if not data.startswith(PNG_SIG):
         raise ValueError("Invalid PNG")
-    i = 8
-    while i + 12 <= len(d):
-        n = struct.unpack(">I", d[i:i+4])[0]
-        k = d[i+4:i+8]
-        p = d[i+8:i+8+n]
-        if len(p) != n:
-            break
-        if k == b"tEXt" and p.startswith(M):
-            return zlib.decompress(p[len(M):])
-        i += n + 12
-        if k == b"IEND":
-            break
+    for _, kind, payload in iter_chunks(data):
+        if kind == b"tEXt" and payload.startswith(MARKER):
+            return zlib.decompress(payload[len(MARKER):])
     raise ValueError("No embedded script")
 
+
 def open_image():
-    f = filedialog.askopenfilename(filetypes=[("PNG", "*.png")])
-    if not f:
+    path = filedialog.askopenfilename(filetypes=[("PNG", "*.png")])
+    if not path:
         return
     try:
-        s = extract(f)
+        script = extract(path)
     except Exception as e:
         messagebox.showerror("Error", str(e))
         return
-    if messagebox.askyesno("PyPicture", "Run image?"):
-        try:
-            exec(compile(s, "<image>", "exec"),
-                 {"__name__": "__main__", "__file__": "<image>"})
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+    try:
+        exec(compile(script, "<image>", "exec"),
+             {"__name__": "__main__", "__file__": "<image>"})
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
+
 
 root = tk.Tk()
 root.title("PyPicture")
