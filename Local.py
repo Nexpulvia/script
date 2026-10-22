@@ -1,13 +1,13 @@
 
-import os
 import re
 import queue
 import threading
 import traceback
 import tkinter as tk
-from tkinter.scrolledtext import ScrolledText
+import webbrowser
 from pathlib import Path
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from tkinter.scrolledtext import ScrolledText
 from urllib.parse import urlsplit, unquote
 
 BASE = Path(__file__).resolve().parent
@@ -18,15 +18,19 @@ active = set()
 restricted = set()
 events = queue.Queue()
 server = None
-server_thread = None
 running = True
+
+
+def log(message):
+    events.put(str(message))
+
 
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        events.put("REQUEST " + (fmt % args))
+        log("REQUEST " + (fmt % args))
 
     def log_error(self, fmt, *args):
-        events.put("HTTP ERROR " + (fmt % args))
+        log("HTTP ERROR " + (fmt % args))
 
     def do_GET(self):
         host = self.headers.get("Host", "").split(":")[0].lower()
@@ -36,9 +40,12 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(400, "Use a valid *.test hostname")
             return
 
-        if name in restricted or name not in active:
-            self.send_error(403 if name in restricted else 404,
-                            "Domain restricted" if name in restricted else "Domain not hosted")
+        if name in restricted:
+            self.send_error(403, "Domain restricted")
+            return
+
+        if name not in active:
+            self.send_error(404, "Domain not hosted")
             return
 
         root = (DOMAINS / name).resolve()
@@ -62,30 +69,32 @@ class Handler(SimpleHTTPRequestHandler):
 
         return str(target)
 
+
 class Server(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-def log(message):
-    events.put(str(message))
 
 def start_server():
-    global server, server_thread
+    global server
+
     try:
         server = Server(("0.0.0.0", PORT), Handler)
-        server_thread = threading.Thread(
-            target=server.serve_forever, daemon=True
-        )
-        server_thread.start()
+        threading.Thread(
+            target=server.serve_forever,
+            daemon=True
+        ).start()
         log(f"SERVER started on port {PORT}")
-        log(f"Domains directory: {DOMAINS}")
+        log(f"Domains folder: {DOMAINS}")
     except Exception:
         log("SERVER STARTUP ERROR")
         log(traceback.format_exc())
         server = None
 
+
 def command(line):
     global server
+
     args = line.strip().lower().split()
 
     if not args:
@@ -94,7 +103,7 @@ def command(line):
     cmd = args[0]
 
     if cmd == "help":
-        log("Commands: host <name>, restrict <name>, status, help, shutdown")
+        log("Commands: host <name>, open <name>, restrict <name>, status, help, shutdown")
         return
 
     if cmd == "host" and len(args) == 2:
@@ -116,6 +125,22 @@ def command(line):
         restricted.discard(name)
         active.add(name)
         log(f"HOSTING {name}.test:{PORT}")
+        return
+
+    if cmd == "open" and len(args) == 2:
+        name = args[1].removesuffix(".test")
+
+        if not re.fullmatch(r"[a-z0-9_-]+", name):
+            log("ERROR invalid domain name")
+            return
+
+        if name in restricted or name not in active:
+            log(f"ERROR {name}.test is not hosted or is restricted")
+            return
+
+        url = f"http://{name}.test:{PORT}"
+        webbrowser.open(url)
+        log(f"OPENED {url}")
         return
 
     if cmd == "restrict" and len(args) == 2:
@@ -143,23 +168,29 @@ def command(line):
         if server:
             old = server
             server = None
-            threading.Thread(target=old.shutdown, daemon=True).start()
-            threading.Thread(target=old.server_close, daemon=True).start()
+            threading.Thread(
+                target=old.shutdown,
+                daemon=True
+            ).start()
+            old.server_close()
 
         log("SHUTDOWN all domains disabled; server stopped")
         return
 
     log("ERROR invalid command. Type help.")
 
+
 def submit(event=None):
     line = entry.get()
     entry.delete(0, tk.END)
     log("> " + line)
+
     try:
         command(line)
     except Exception:
         log("COMMAND ERROR")
         log(traceback.format_exc())
+
 
 def update_log():
     while not events.empty():
@@ -175,11 +206,30 @@ def update_log():
     if running:
         root.after(100, update_log)
 
+
+def close_app():
+    global running, server
+
+    running = False
+    active.clear()
+
+    if server:
+        server.shutdown()
+        server.server_close()
+        server = None
+
+    root.destroy()
+
+
 root = tk.Tk()
 root.title("LocalNet command line")
 root.geometry("760x480")
 
-output = ScrolledText(root, state="disabled", font=("Consolas", 10))
+output = ScrolledText(
+    root,
+    state="disabled",
+    font=("Consolas", 10)
+)
 output.pack(fill="both", expand=True, padx=8, pady=(8, 4))
 
 entry = tk.Entry(root, font=("Consolas", 11))
@@ -187,17 +237,15 @@ entry.pack(fill="x", padx=8, pady=(4, 8))
 entry.bind("<Return>", submit)
 entry.focus_set()
 
-root.protocol("WM_DELETE_WINDOW", lambda: (
-    command("shutdown"), root.destroy()
-))
+root.protocol("WM_DELETE_WINDOW", close_app)
+
+log("LocalNet command line")
 
 if not DOMAINS.is_dir():
     log(f"ERROR Domains folder missing: {DOMAINS}")
 else:
     start_server()
 
-log("LocalNet command line")
 log("Type help to see commands.")
-update_log()
 root.mainloop()
 running = False
