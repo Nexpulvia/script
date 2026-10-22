@@ -1,99 +1,135 @@
-import os
-import sys
-import platform
+
+import struct
+import zlib
+import tkinter as tk
+from tkinter import filedialog, messagebox
 from pathlib import Path
 
-M = b"\n#---PYSTART---\n"
+SIGNATURE = b"\x89PNG\r\n\x1a\n"
+MARKER = b"PyPicture:Python:"
 
-B = r"""
-  ____        ____  _      _                _       
- |  _ \ _   _|  _ \(_) ___| |_ _ __ _   _| |_ ___ 
- | |_) | | | | |_) | |/ __| __| '__| | | | __/ _ \
- |  __/| |_| |  __/| | (__| |_| |  | |_| | ||  __/
- |_|    \__, |_|   |_|\___|\__|_|   \__,_|\__\___|
-        |___/         PyPicture
-"""
+def embed():
+    image = filedialog.askopenfilename(
+        title="Select PNG",
+        filetypes=[("PNG images", "*.png")]
+    )
+    if not image:
+        return
 
-def d() -> Path:
-    h = Path.home()
-    for n in ("Downloads", "downloads", "Descargas", "Téléchargements"):
-        p = h / n
-        if p.is_dir():
-            return p
-    return h
+    script = filedialog.askopenfilename(
+        title="Select Python script",
+        filetypes=[("Python files", "*.py")]
+    )
+    if not script:
+        return
 
-def p(m: str) -> str:
-    return input(m).strip().strip('"').strip("'")
+    data = Path(image).read_bytes()
+    if not data.startswith(SIGNATURE):
+        messagebox.showerror("Error", "Invalid PNG file")
+        return
 
-def b(i: str, s: str) -> Path:
-    a = Path(i).expanduser().resolve()
-    c = Path(s).expanduser().resolve()
-    if not a.is_file():
-        raise FileNotFoundError(f"Image not found: {a}")
-    if not c.is_file():
-        raise FileNotFoundError(f"Script not found: {c}")
-    x = a.read_bytes()
-    y = c.read_bytes()
-    o = d() / f"{c.stem}.png"
-    with open(o, "wb") as f:
-        f.write(x)
-        f.write(M)
-        f.write(y)
-    return o
+    source = Path(script).read_bytes()
+    payload = MARKER + zlib.compress(source)
+    chunk = (
+        struct.pack(">I", len(payload))
+        + b"tEXt"
+        + payload
+    )
+    chunk += struct.pack(">I", zlib.crc32(b"tEXt" + payload) & 0xffffffff)
 
-def r(t: Path) -> Path:
-    s = platform.system()
-    if s == "Windows":
-        q = t.with_suffix(".bat")
-        q.write_text(
-            "@echo off\n"
-            f'python -c "import sys;d=open(r\'{t}\',\'rb\').read();i=d.rfind(b\'\\n#---PYSTART---\\n\');exec(d[i+18:])"\n'
-            "pause\n",
-            encoding="utf-8",
-        )
-    else:
-        q = t.with_suffix(".command" if s == "Darwin" else ".sh")
-        q.write_text(
-            "#!/usr/bin/env bash\n"
-            f'python3 -c "import sys;d=open(r\'{t}\',\'rb\').read();i=d.rfind(b\'\\n#---PYSTART---\\n\');exec(d[i+18:])"\n'
-            "read -p 'Press enter to close...'\n",
-            encoding="utf-8",
-        )
-        os.chmod(q, 0o755)
-    return q
+    pos = 8
+    while pos + 12 <= len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        kind = data[pos + 4:pos + 8]
+        pos += 12 + length
+        if kind == b"IEND":
+            pos -= 12 + length
+            break
 
-def m():
-    print(B)
-    print("[*] PyPicture - Python Embedder for Images")
-    print()
-    print("[?] Enter path to image (png/jpg):")
-    i = p("    > ")
-    print("[?] Enter path to python script (.py):")
-    s = p("    > ")
-    print()
-    print("[+] BUILDING...")
+    output = Path(image).with_name(Path(image).stem + "_embedded.png")
+    output.write_bytes(data[:pos] + chunk + data[pos:])
+    messagebox.showinfo("PyPicture", f"Created:\n{output}")
+
+def extract(path):
+    data = Path(path).read_bytes()
+    pos = 8
+
+    while pos + 12 <= len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        kind = data[pos + 4:pos + 8]
+        start = pos + 8
+        payload = data[start:start + length]
+
+        if kind == b"tEXt" and payload.startswith(MARKER):
+            return zlib.decompress(payload[len(MARKER):])
+
+        pos += length + 12
+        if kind == b"IEND":
+            break
+
+    raise ValueError("No embedded Python source found")
+
+def viewer():
+    path = filedialog.askopenfilename(
+        title="Open PyPicture",
+        filetypes=[("PNG images", "*.png")]
+    )
+    if not path:
+        return
+
     try:
-        o = b(i, s)
+        source = extract(path)
     except Exception as e:
-        print(f"[!] ERROR: {e}")
-        sys.exit(1)
-    print(f"[+] Embedded image written: {o}")
-    try:
-        q = r(o)
-        print(f"[+] Runner created:        {q}")
-    except Exception as e:
-        print(f"[!] Could not create runner: {e}")
-        q = None
-    print()
-    print("[+] DONE")
-    print(f"    Image   : {o}")
-    if q:
-        print(f"    Launcher: {q}")
-    print()
-    print("[i] The .png opens normally in any image viewer.")
-    print("[i] Double-click the launcher to execute the embedded script.")
-    print()
-    input("Press enter to exit...")
+        messagebox.showerror("PyPicture", str(e))
+        return
 
-if __name__ == "__main__":
-    m()
+    window = tk.Toplevel(root)
+    window.title("PyPicture Viewer")
+    window.geometry("500x180")
+
+    tk.Label(
+        window,
+        text=Path(path).name,
+        font=("Arial", 12, "bold")
+    ).pack(pady=12)
+
+    tk.Label(
+        window,
+        text="This image contains an embedded Python script."
+    ).pack(pady=4)
+
+    def run():
+        if not messagebox.askyesno(
+            "Confirm execution",
+            "Run the embedded Python code?\nOnly continue if you trust its source."
+        ):
+            return
+
+        try:
+            exec(
+                compile(source, "<embedded>", "exec"),
+                {"__name__": "__main__", "__file__": "<embedded>"}
+            )
+        except Exception as e:
+            messagebox.showerror("Execution error", str(e))
+
+    tk.Button(
+        window,
+        text="Run embedded Python",
+        command=run
+    ).pack(pady=12)
+
+root = tk.Tk()
+root.title("PyPicture")
+root.geometry("320x160")
+
+tk.Label(
+    root,
+    text="PyPicture",
+    font=("Arial", 18, "bold")
+).pack(pady=15)
+
+tk.Button(root, text="Embed Python into PNG", command=embed).pack(pady=5)
+tk.Button(root, text="Open PyPicture", command=viewer).pack(pady=5)
+
+root.mainloop()
