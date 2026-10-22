@@ -1,6 +1,6 @@
 
-import re
 import queue
+import re
 import threading
 import traceback
 import tkinter as tk
@@ -18,12 +18,11 @@ active = set()
 restricted = set()
 events = queue.Queue()
 server = None
-running = True
-
+server_thread = None
+server_running = False
 
 def log(message):
     events.put(str(message))
-
 
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -69,32 +68,52 @@ class Handler(SimpleHTTPRequestHandler):
 
         return str(target)
 
-
 class Server(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-
 def start_server():
-    global server
+    global server, server_thread, server_running
 
     try:
         server = Server(("0.0.0.0", PORT), Handler)
-        threading.Thread(
+        server_running = True
+        server_thread = threading.Thread(
             target=server.serve_forever,
             daemon=True
-        ).start()
+        )
+        server_thread.start()
         log(f"SERVER started on port {PORT}")
         log(f"Domains folder: {DOMAINS}")
     except Exception:
+        server = None
+        server_running = False
         log("SERVER STARTUP ERROR")
         log(traceback.format_exc())
-        server = None
 
+def stop_server():
+    global server, server_running
+
+    old = server
+    server = None
+    server_running = False
+    active.clear()
+
+    if old:
+        def stop():
+            try:
+                old.shutdown()
+                old.server_close()
+                log("SERVER stopped")
+            except Exception:
+                log("SHUTDOWN ERROR")
+                log(traceback.format_exc())
+
+        threading.Thread(target=stop, daemon=True).start()
+    else:
+        log("SERVER is already stopped")
 
 def command(line):
-    global server
-
     args = line.strip().lower().split()
 
     if not args:
@@ -119,6 +138,10 @@ def command(line):
             log(f"ERROR folder not found: Domains/{name}")
             return
 
+        if not server_running:
+            log("ERROR server is stopped")
+            return
+
         if not (folder / "index.html").is_file():
             log(f"WARNING Domains/{name}/index.html is missing")
 
@@ -134,13 +157,17 @@ def command(line):
             log("ERROR invalid domain name")
             return
 
-        if name in restricted or name not in active:
-            log(f"ERROR {name}.test is not hosted or is restricted")
+        if not server_running or name not in active or name in restricted:
+            log(f"ERROR {name}.test is not hosted")
             return
 
         url = f"http://{name}.test:{PORT}"
-        webbrowser.open(url)
-        log(f"OPENED {url}")
+        try:
+            webbrowser.open(url)
+            log(f"OPENED {url}")
+        except Exception:
+            log("BROWSER ERROR")
+            log(traceback.format_exc())
         return
 
     if cmd == "restrict" and len(args) == 2:
@@ -158,27 +185,14 @@ def command(line):
     if cmd == "status" and len(args) == 1:
         log(f"Active: {', '.join(sorted(active)) or 'none'}")
         log(f"Restricted: {', '.join(sorted(restricted)) or 'none'}")
-        log(f"Server: {'running' if server else 'stopped'}")
+        log(f"Server: {'running' if server_running else 'stopped'}")
         return
 
     if cmd == "shutdown" and len(args) == 1:
-        active.clear()
-        restricted.clear()
-
-        if server:
-            old = server
-            server = None
-            threading.Thread(
-                target=old.shutdown,
-                daemon=True
-            ).start()
-            old.server_close()
-
-        log("SHUTDOWN all domains disabled; server stopped")
+        stop_server()
         return
 
     log("ERROR invalid command. Type help.")
-
 
 def submit(event=None):
     line = entry.get()
@@ -191,35 +205,32 @@ def submit(event=None):
         log("COMMAND ERROR")
         log(traceback.format_exc())
 
-
 def update_log():
-    while not events.empty():
-        try:
+    try:
+        while True:
             message = events.get_nowait()
             output.configure(state="normal")
             output.insert(tk.END, message + "\n")
             output.see(tk.END)
             output.configure(state="disabled")
-        except Exception:
-            break
+    except queue.Empty:
+        pass
+    except Exception:
+        traceback.print_exc()
 
-    if running:
-        root.after(100, update_log)
-
+    if root.winfo_exists():
+        root.after(50, update_log)
 
 def close_app():
-    global running, server
+    global server_running
 
-    running = False
-    active.clear()
+    server_running = False
+    old = server
 
-    if server:
-        server.shutdown()
-        server.server_close()
-        server = None
+    if old:
+        threading.Thread(target=stop_server, daemon=True).start()
 
     root.destroy()
-
 
 root = tk.Tk()
 root.title("LocalNet command line")
@@ -247,5 +258,5 @@ else:
     start_server()
 
 log("Type help to see commands.")
+update_log()
 root.mainloop()
-running = False
