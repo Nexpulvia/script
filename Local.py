@@ -750,6 +750,8 @@ class LocalNetApp:
                 self._cmd_dns(args)
             elif verb == "verify":
                 self._cmd_verify(args)
+            elif verb == "about":
+                self._cmd_about()
             elif verb == "help":
                 self._cmd_help()
             else:
@@ -962,6 +964,10 @@ class LocalNetApp:
                 mark = " [restricted]" if n in restricted else ""
                 self._log(f"    - http://{d}:{HTTP_PORT}  ->  {ip}{mark}")
 
+    def _cmd_about(self):
+        self._log("  LocalNet — a hobby tool for running small test domains.")
+        self._log("  Hosts .localnet sites on port 8000 from Domains/<name>/index.html.")
+
     def _cmd_shutdown(self):
         self.dns.stop()
         self.server.stop()
@@ -981,6 +987,7 @@ class LocalNetApp:
         self._log("  dns start|stop       Optional local DNS server (UDP 53) for LAN clients")
         self._log("  verify               End-to-end check: hosts, HTTP, DNS, firewall")
         self._log("  status               Show services, firewall, DNS, hosted domains")
+        self._log("  about                Show a short description of LocalNet")
         self._log("  shutdown             Stop services and clean LocalNet hosts entries")
         self._log("  help                 Show this help")
 
