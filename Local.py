@@ -38,6 +38,17 @@ def is_admin():
         return False
 
 
+def relaunch_as_admin():
+    try:
+        params = " ".join(f'"{a}"' for a in sys.argv)
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, params, None, 1
+        )
+        return True
+    except Exception:
+        return False
+
+
 def validate_name(name):
     if not name or not isinstance(name, str):
         return None
@@ -57,15 +68,15 @@ class LogQueue:
     def __init__(self):
         self.q = queue.Queue()
 
-    def put(self, msg):
-        self.q.put(msg)
+    def put(self, msg, level="info"):
+        self.q.put((level, msg))
 
-    def drain(self, widget):
+    def drain(self, widget, tag_config):
         try:
             while True:
-                msg = self.q.get_nowait()
+                level, msg = self.q.get_nowait()
                 widget.configure(state="normal")
-                widget.insert(tk.END, msg + "\n")
+                widget.insert(tk.END, msg + "\n", level)
                 widget.see(tk.END)
                 widget.configure(state="disabled")
         except queue.Empty:
@@ -224,7 +235,7 @@ class Server:
         try:
             self.httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
         except OSError as e:
-            self.log(f"HTTP server failed to bind port {HTTP_PORT}: {e}")
+            self.log(f"HTTP server failed to bind port {HTTP_PORT}: {e}", "error")
             self.httpd = None
             return False
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -258,7 +269,7 @@ class HostsManager:
         try:
             return HOSTS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
         except OSError as e:
-            self.log(f"Could not read hosts file: {e}")
+            self.log(f"Could not read hosts file: {e}", "error")
             return []
 
     def _write(self, lines):
@@ -268,7 +279,7 @@ class HostsManager:
             shutil.move(str(tmp), str(HOSTS_FILE))
             return True
         except PermissionError:
-            self.log("Administrator privileges are required to modify the hosts file.")
+            self.log("Administrator privileges are required to modify the hosts file.", "error")
             try:
                 if tmp.exists():
                     tmp.unlink()
@@ -276,7 +287,7 @@ class HostsManager:
                 pass
             return False
         except OSError as e:
-            self.log(f"Could not write hosts file: {e}")
+            self.log(f"Could not write hosts file: {e}", "error")
             return False
 
     def add(self, domain):
@@ -349,11 +360,19 @@ class LocalNetApp:
         self.root.title("LocalNet command line")
         self.root.configure(bg="#0c0c0c")
         self.root.geometry("900x560")
+
+        output_frame = tk.Frame(self.root, bg="#0c0c0c")
+        output_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(6, 0))
+
         self.output = scrolledtext.ScrolledText(
-            self.root, bg="#0c0c0c", fg="#d0d0d0", insertbackground="#d0d0d0",
+            output_frame, bg="#0c0c0c", fg="#d0d0d0", insertbackground="#d0d0d0",
             font=("Consolas", 10), borderwidth=0, state="disabled"
         )
-        self.output.pack(fill=tk.BOTH, expand=True, padx=6, pady=(6, 0))
+        self.output.pack(fill=tk.BOTH, expand=True)
+        self.output.tag_config("error", foreground="#ff5555")
+        self.output.tag_config("info", foreground="#d0d0d0")
+        self.output.tag_config("success", foreground="#4ec9b0")
+
         bottom = tk.Frame(self.root, bg="#0c0c0c")
         bottom.pack(fill=tk.X, padx=6, pady=6)
         tk.Label(bottom, text=">", bg="#0c0c0c", fg="#4ec9b0",
@@ -367,11 +386,11 @@ class LocalNetApp:
         self.entry.focus_set()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _log(self, msg):
-        self.logq.put(msg)
+    def _log(self, msg, level="info"):
+        self.logq.put(msg, level)
 
     def _pump(self):
-        self.logq.drain(self.output)
+        self.logq.drain(self.output, None)
         self.root.after(80, self._pump)
 
     def _on_enter(self, event):
@@ -400,17 +419,17 @@ class LocalNetApp:
             elif verb == "help":
                 self._cmd_help()
             else:
-                self._log(f"Unknown command: {verb}")
+                self._log(f"Unknown command: {verb}", "error")
         except Exception as e:
-            self._log(f"Error: {e}")
+            self._log(f"Error: {e}", "error")
 
     def _require_name(self, args):
         if len(args) != 1:
-            self._log("Usage: <command> <name>")
+            self._log("Usage: <command> <name>", "error")
             return None
         name = validate_name(args[0])
         if not name:
-            self._log(f"Invalid domain name: {args[0]}")
+            self._log(f"Invalid domain name: {args[0]}", "error")
             return None
         return name
 
@@ -422,18 +441,18 @@ class LocalNetApp:
         self._log(f"Website directory: {folder}")
         if not self.server.running():
             if port_in_use(HTTP_PORT):
-                self._log(f"Port {HTTP_PORT} is already in use by another process.")
+                self._log(f"Port {HTTP_PORT} is already in use by another process.", "error")
                 return
             if not self.server.start():
-                self._log("Hosting failed: HTTP server did not start.")
+                self._log("Hosting failed: HTTP server did not start.", "error")
                 return
         self.store.add(name)
         domain = full_domain(name)
         hosts_ok = self.hosts.add(domain)
         if not hosts_ok:
-            self._log("Same-PC resolution not configured (hosts file needs admin).")
+            self._log("Same-PC resolution not configured (hosts file needs admin).", "error")
         lan_ip = detect_lan_ip()
-        self._log(f"Hosted: http://{domain}:{HTTP_PORT}")
+        self._log(f"Hosted: http://{domain}:{HTTP_PORT}", "success")
         self._log(f"LAN URL: http://{lan_ip}:{HTTP_PORT} (Host header required for other devices)")
 
     def _cmd_open(self, args):
@@ -441,26 +460,26 @@ class LocalNetApp:
         if not name:
             return
         if name not in self.store.list_hosted():
-            self._log(f"Domain '{name}' is not hosted. Use 'host {name}' first.")
+            self._log(f"Domain '{name}' is not hosted. Use 'host {name}' first.", "error")
             return
         if self.store.is_restricted(name):
-            self._log(f"Domain '{name}' is restricted.")
+            self._log(f"Domain '{name}' is restricted.", "error")
             return
         url = f"http://{full_domain(name)}:{HTTP_PORT}"
         try:
             webbrowser.open(url)
-            self._log(f"Opened {url}")
+            self._log(f"Opened {url}", "success")
         except Exception as e:
-            self._log(f"Could not open browser: {e}")
+            self._log(f"Could not open browser: {e}", "error")
 
     def _cmd_restrict(self, args):
         name = self._require_name(args)
         if not name:
             return
         if self.store.restrict(name):
-            self._log(f"Domain '{name}' is now restricted.")
+            self._log(f"Domain '{name}' is now restricted.", "success")
         else:
-            self._log(f"Domain '{name}' is not hosted.")
+            self._log(f"Domain '{name}' is not hosted.", "error")
 
     def _cmd_status(self):
         self._log("--- LocalNet status ---")
@@ -484,7 +503,7 @@ class LocalNetApp:
         self.hosts.remove_managed()
         self.store.hosted.clear()
         self.store.restricted.clear()
-        self._log("Shutdown complete.")
+        self._log("Shutdown complete.", "success")
 
     def _cmd_help(self):
         self._log("Commands:")
@@ -505,6 +524,9 @@ class LocalNetApp:
 
 
 def main():
+    if not is_admin():
+        if relaunch_as_admin():
+            return
     DOMAINS_DIR.mkdir(parents=True, exist_ok=True)
     root = tk.Tk()
     LocalNetApp(root)
