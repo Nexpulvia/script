@@ -18,11 +18,12 @@ active = set()
 restricted = set()
 events = queue.Queue()
 server = None
-server_thread = None
 server_running = False
+
 
 def log(message):
     events.put(str(message))
+
 
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -34,6 +35,9 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         host = self.headers.get("Host", "").split(":")[0].lower()
         name = host[:-5] if host.endswith(".test") else ""
+
+        if host in ("127.0.0.1", "localhost"):
+            name = "test"
 
         if not name or not re.fullmatch(r"[a-z0-9_-]+", name):
             self.send_error(400, "Use a valid *.test hostname")
@@ -68,28 +72,33 @@ class Handler(SimpleHTTPRequestHandler):
 
         return str(target)
 
+
 class Server(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+
 def start_server():
-    global server, server_thread, server_running
+    global server, server_running
 
     try:
         server = Server(("0.0.0.0", PORT), Handler)
         server_running = True
-        server_thread = threading.Thread(
+
+        threading.Thread(
             target=server.serve_forever,
             daemon=True
-        )
-        server_thread.start()
+        ).start()
+
         log(f"SERVER started on port {PORT}")
         log(f"Domains folder: {DOMAINS}")
+
     except Exception:
         server = None
         server_running = False
         log("SERVER STARTUP ERROR")
         log(traceback.format_exc())
+
 
 def stop_server():
     global server, server_running
@@ -112,6 +121,7 @@ def stop_server():
         threading.Thread(target=stop, daemon=True).start()
     else:
         log("SERVER is already stopped")
+
 
 def command(line):
     args = line.strip().lower().split()
@@ -162,12 +172,14 @@ def command(line):
             return
 
         url = f"http://{name}.test:{PORT}"
+
         try:
             webbrowser.open(url)
             log(f"OPENED {url}")
         except Exception:
             log("BROWSER ERROR")
             log(traceback.format_exc())
+
         return
 
     if cmd == "restrict" and len(args) == 2:
@@ -194,6 +206,7 @@ def command(line):
 
     log("ERROR invalid command. Type help.")
 
+
 def submit(event=None):
     line = entry.get()
     entry.delete(0, tk.END)
@@ -204,6 +217,7 @@ def submit(event=None):
     except Exception:
         log("COMMAND ERROR")
         log(traceback.format_exc())
+
 
 def update_log():
     try:
@@ -221,16 +235,23 @@ def update_log():
     if root.winfo_exists():
         root.after(50, update_log)
 
-def close_app():
-    global server_running
 
+def close_app():
+    global server, server_running
+
+    active.clear()
     server_running = False
     old = server
+    server = None
 
     if old:
-        threading.Thread(target=stop_server, daemon=True).start()
+        threading.Thread(
+            target=lambda: (old.shutdown(), old.server_close()),
+            daemon=True
+        ).start()
 
     root.destroy()
+
 
 root = tk.Tk()
 root.title("LocalNet command line")
