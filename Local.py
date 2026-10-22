@@ -12,23 +12,27 @@ import webbrowser
 from pathlib import Path
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from tkinter.scrolledtext import ScrolledText
+from urllib.parse import unquote, urlsplit
 
 BASE = Path(__file__).resolve().parent
 DOMAINS = (BASE / "Domains").resolve()
 PORT = 8000
 SSID = "LocalNet"
-PASSWORD = "LocalNet2026!"
+PASSWORD = "LocalNet123"
 GATEWAY = "192.168.137.1"
 UPSTREAM_DNS = ("1.1.1.1", 53)
 
 active = set()
 restricted = set()
 events = queue.Queue()
+
 server = None
 dns_socket = None
 dns_thread = None
 hotspot_started = False
 closing = False
+started = False
+lock = threading.RLock()
 
 
 def log(s):
@@ -37,12 +41,15 @@ def log(s):
 
 def run(args, timeout=10):
     return subprocess.run(
-        args, capture_output=True, text=True,
-        timeout=timeout, shell=False
+        args,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        shell=False
     )
 
 
-def admin():
+def is_admin():
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
@@ -52,31 +59,38 @@ def admin():
 def start_hotspot():
     global hotspot_started
 
-    log("Checking legacy Windows hosted-network support...")
+    if not is_admin():
+        log("ERROR: Run LocalNet as Administrator to start the hotspot.")
+        return False
+
+    log("Configuring Wi-Fi network...")
 
     try:
         r = run([
             "netsh", "wlan", "set", "hostednetwork",
-            "mode=allow", f"ssid={SSID}", f"key={PASSWORD}"
+            "mode=allow",
+            f"ssid={SSID}",
+            f"key={PASSWORD}"
         ])
+
         log((r.stdout + r.stderr).strip())
 
         if r.returncode != 0:
-            log("Hotspot setup failed. This adapter may not support hostednetwork.")
-            log("Open Windows Settings > Network & internet > Mobile hotspot.")
+            log("ERROR: This Wi-Fi adapter may not support legacy hosted networks.")
+            log("Try Windows Settings > Network & internet > Mobile hotspot.")
             return False
 
         r = run(["netsh", "wlan", "start", "hostednetwork"])
         log((r.stdout + r.stderr).strip())
 
-        if r.returncode != 0 or "started" not in r.stdout.lower():
-            log("Windows could not start the legacy hotspot.")
-            log("Use Windows Mobile Hotspot manually on this PC.")
+        if r.returncode != 0:
+            log("ERROR: Windows could not start the hotspot.")
             return False
 
         hotspot_started = True
-        log("Legacy hotspot started.")
-        log("Note: internet sharing and client DHCP may still need Windows ICS.")
+        log(f"Wi-Fi network started: {SSID}")
+        log(f"Wi-Fi password: {PASSWORD}")
+        log("WARNING: Internet sharing and DHCP may need separate configuration.")
         return True
 
     except Exception:
@@ -85,28 +99,13 @@ def start_hotspot():
         return False
 
 
-def stop_hotspot():
-    global hotspot_started
-
-    if not hotspot_started:
-        return
-
-    try:
-        r = run(["netsh", "wlan", "stop", "hostednetwork"])
-        log((r.stdout + r.stderr).strip())
-    except Exception:
-        log(traceback.format_exc())
-
-    hotspot_started = False
-
-
 def dns_response(data):
     if len(data) < 12:
         return None
 
     ident, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", data[:12])
 
-    if qd < 1:
+    if qd != 1:
         return None
 
     pos = 12
@@ -116,38 +115,50 @@ def dns_response(data):
         while True:
             length = data[pos]
             pos += 1
+
             if length == 0:
                 break
-            if length & 0xC0:
+
+            if length & 0xC0 or pos + length > len(data):
                 return None
-            labels.append(data[pos:pos + length].decode("ascii").lower())
+
+            labels.append(
+                data[pos:pos + length].decode("ascii").lower()
+            )
             pos += length
 
         if pos + 4 > len(data):
             return None
 
         qtype, qclass = struct.unpack("!HH", data[pos:pos + 4])
-        question_end = pos + 4
+        end = pos + 4
         name = ".".join(labels)
+        question = data[12:end]
 
-        if name.endswith(".test") and qtype in (1, 255) and qclass == 1:
+        if name.endswith(".test") and qclass == 1:
             host = name[:-5]
 
-            if (re.fullmatch(r"[a-z0-9_-]+", host)
-                    and host in active and host not in restricted):
+            if (
+                re.fullmatch(r"[a-z0-9_-]+", host)
+                and host in active
+                and host not in restricted
+                and qtype in (1, 255)
+            ):
                 answer = (
                     b"\xc0\x0c"
                     + struct.pack("!HHIH", 1, 1, 60, 4)
                     + socket.inet_aton(GATEWAY)
                 )
+
                 return (
                     struct.pack("!HHHHHH", ident, 0x8180, 1, 1, 0, 0)
-                    + data[12:question_end] + answer
+                    + question
+                    + answer
                 )
 
             return (
                 struct.pack("!HHHHHH", ident, 0x8183, 1, 0, 0, 0)
-                + data[12:question_end]
+                + question
             )
 
         return None
@@ -159,15 +170,27 @@ def dns_response(data):
 def dns_loop():
     global dns_socket
 
+    s = None
+
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", 53))
         s.settimeout(1)
-        dns_socket = s
-        log("DNS listening on UDP port 53.")
 
-        while not closing:
+        with lock:
+            if closing:
+                s.close()
+                return
+            dns_socket = s
+
+        log("DNS server listening on UDP port 53.")
+
+        while True:
+            with lock:
+                if closing:
+                    break
+
             try:
                 data, addr = s.recvfrom(4096)
             except socket.timeout:
@@ -178,7 +201,10 @@ def dns_loop():
             response = dns_response(data)
 
             if response:
-                s.sendto(response, addr)
+                try:
+                    s.sendto(response, addr)
+                except OSError:
+                    break
                 continue
 
             try:
@@ -191,18 +217,22 @@ def dns_loop():
                 log(f"DNS forwarding error: {e}")
 
     except PermissionError:
-        log("DNS ERROR: administrator rights are required for port 53.")
+        log("DNS ERROR: Administrator rights required for port 53.")
     except OSError as e:
-        log(f"DNS ERROR: {e}. Another DNS service may already use port 53.")
+        log(f"DNS ERROR: {e}")
+        log("Port 53 may already be in use.")
     except Exception:
         log(traceback.format_exc())
     finally:
-        if dns_socket:
+        if s:
             try:
-                dns_socket.close()
+                s.close()
             except Exception:
                 pass
-            dns_socket = None
+
+        with lock:
+            if dns_socket is s:
+                dns_socket = None
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -216,15 +246,14 @@ class Handler(SimpleHTTPRequestHandler):
         if host in ("127.0.0.1", "localhost"):
             name = "test"
 
+        with lock:
+            is_active = name in active and name not in restricted
+
         if not re.fullmatch(r"[a-z0-9_-]+", name):
             self.send_error(400, "Use a valid *.test hostname")
             return
 
-        if name in restricted:
-            self.send_error(403, "Domain restricted")
-            return
-
-        if name not in active:
+        if not is_active:
             self.send_error(404, "Domain not hosted")
             return
 
@@ -238,10 +267,10 @@ class Handler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def translate_path(self, path):
-        from urllib.parse import unquote, urlsplit
-
         root = Path(self.directory).resolve()
-        target = (root / unquote(urlsplit(path).path).lstrip("/")).resolve()
+        target = (
+            root / unquote(urlsplit(path).path).lstrip("/")
+        ).resolve()
 
         try:
             target.relative_to(root)
@@ -251,83 +280,224 @@ class Handler(SimpleHTTPRequestHandler):
         return str(target)
 
 
-def start_web():
-    global server
+def start_services():
+    global server, dns_thread, started
+
+    with lock:
+        if closing:
+            return False
+
+        if started:
+            return True
+
+    log("Starting LocalNet services...")
 
     try:
-        server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        new_server = ThreadingHTTPServer(
+            ("0.0.0.0", PORT),
+            Handler
+        )
+        new_server.daemon_threads = True
+
+        with lock:
+            if closing:
+                new_server.server_close()
+                return False
+
+            server = new_server
+            started = True
+
+        threading.Thread(
+            target=new_server.serve_forever,
+            daemon=True
+        ).start()
+
         log(f"HTTP server listening on port {PORT}.")
+
+        dns_thread = threading.Thread(
+            target=dns_loop,
+            daemon=True
+        )
+        dns_thread.start()
+
+        return True
+
     except Exception:
-        log("HTTP SERVER ERROR")
+        log("SERVICE START ERROR")
         log(traceback.format_exc())
+        return False
+
+
+def stop_services():
+    global server, started, dns_socket
+
+    with lock:
+        old_server = server
+        old_dns = dns_socket
+        server = None
+        dns_socket = None
+        started = False
+        active.clear()
+
+    if old_dns:
+        try:
+            old_dns.close()
+        except Exception:
+            pass
+
+    if old_server:
+        try:
+            old_server.shutdown()
+            old_server.server_close()
+        except Exception:
+            log(traceback.format_exc())
+
+    log("LocalNet web and DNS services stopped.")
+
+
+def stop_hotspot():
+    global hotspot_started
+
+    if not hotspot_started:
+        return
+
+    try:
+        r = run(["netsh", "wlan", "stop", "hostednetwork"])
+        log((r.stdout + r.stderr).strip())
+
+        if r.returncode == 0:
+            log("LocalNet hotspot stopped.")
+        else:
+            log("WARNING: Windows did not confirm hotspot shutdown.")
+    except Exception:
+        log(traceback.format_exc())
+
+    hotspot_started = False
+
+
+def valid_name(name):
+    name = name.removesuffix(".test")
+
+    if not re.fullmatch(r"[a-z0-9_-]+", name):
+        log("ERROR: Invalid domain name.")
+        return None
+
+    return name
 
 
 def command(line):
     args = line.strip().lower().split()
+
     if not args:
         return
 
     cmd = args[0]
 
     if cmd == "help":
-        log("host <name> | open <name> | restrict <name> | status | hotspot | shutdown")
-    elif cmd == "host" and len(args) == 2:
-        name = args[1].removesuffix(".test")
-        if not re.fullmatch(r"[a-z0-9_-]+", name):
-            log("Invalid domain name.")
+        log("Commands:")
+        log("  host <name>     Start services and host a domain")
+        log("  open <name>     Open a hosted domain")
+        log("  restrict <name> Disable a domain")
+        log("  status          Show current status")
+        log("  shutdown        Stop services and close LocalNet")
+        return
+
+    if cmd == "host" and len(args) == 2:
+        name = valid_name(args[1])
+
+        if not name:
             return
+
         folder = (DOMAINS / name).resolve()
+
         if folder.parent != DOMAINS or not folder.is_dir():
-            log(f"Missing folder: Domains/{name}")
+            log(f"ERROR: Create the folder Domains/{name} first.")
             return
-        active.add(name)
-        restricted.discard(name)
-        log(f"Hosting {name}.test")
-        if not (folder / "index.html").exists():
-            log("WARNING: index.html is missing.")
-    elif cmd == "open" and len(args) == 2:
-        name = args[1].removesuffix(".test")
-        if name in active and name not in restricted:
-            webbrowser.open(f"http://{name}.test:{PORT}")
-            log(f"Opened {name}.test")
-            log("If the name doesn't resolve on this PC, configure its hosts file.")
-        else:
-            log("Domain isn't hosted.")
-    elif cmd == "restrict" and len(args) == 2:
-        name = args[1].removesuffix(".test")
-        active.discard(name)
-        restricted.add(name)
-        log(f"Restricted {name}.test")
-    elif cmd == "status":
-        log(f"Hosted: {', '.join(sorted(active)) or 'none'}")
-        log(f"Restricted: {', '.join(sorted(restricted)) or 'none'}")
-        log(f"Hotspot started by app: {hotspot_started}")
-        log(f"DNS thread started: {dns_thread.is_alive() if dns_thread else False}")
-    elif cmd == "hotspot":
-        log("Hotspot is managed at startup. See startup diagnostics above.")
-    elif cmd == "shutdown":
+
+        if not started:
+            start_hotspot()
+            if not start_services():
+                log("ERROR: LocalNet services could not start.")
+                return
+
+        with lock:
+            active.add(name)
+            restricted.discard(name)
+
+        log(f"HOSTING {name}.test:{PORT}")
+
+        if not (folder / "index.html").is_file():
+            log(f"WARNING: Domains/{name}/index.html is missing.")
+
+        log(f"Local test URL: http://127.0.0.1:{PORT}")
+        log("Remote access requires working hotspot networking and DNS.")
+        return
+
+    if cmd == "open" and len(args) == 2:
+        name = valid_name(args[1])
+
+        if not name:
+            return
+
+        with lock:
+            available = started and name in active and name not in restricted
+
+        if not available:
+            log("ERROR: That domain isn't currently hosted.")
+            return
+
+        url = f"http://{name}.test:{PORT}"
+        webbrowser.open(url)
+        log(f"Opening {url}")
+        return
+
+    if cmd == "restrict" and len(args) == 2:
+        name = valid_name(args[1])
+
+        if not name:
+            return
+
+        with lock:
+            active.discard(name)
+            restricted.add(name)
+
+        log(f"RESTRICTED {name}.test")
+        return
+
+    if cmd == "status":
+        with lock:
+            log(f"Services: {'running' if started else 'stopped'}")
+            log(f"Hosted: {', '.join(sorted(active)) or 'none'}")
+            log(f"Restricted: {', '.join(sorted(restricted)) or 'none'}")
+
+        log(f"Hotspot started: {hotspot_started}")
+        return
+
+    if cmd == "shutdown":
         close_app()
-    else:
-        log("Unknown command. Type help.")
+        return
+
+    log("ERROR: Unknown command. Type help.")
 
 
 def submit(event=None):
     line = entry.get()
     entry.delete(0, tk.END)
     log("> " + line)
+
     try:
         command(line)
     except Exception:
+        log("COMMAND ERROR")
         log(traceback.format_exc())
 
 
 def update_log():
     try:
         while True:
-            msg = events.get_nowait()
+            message = events.get_nowait()
             output.configure(state="normal")
-            output.insert(tk.END, msg + "\n")
+            output.insert(tk.END, message + "\n")
             output.see(tk.END)
             output.configure(state="disabled")
     except queue.Empty:
@@ -338,26 +508,14 @@ def update_log():
 
 
 def close_app():
-    global closing, dns_socket
+    global closing
 
-    if closing:
-        return
+    with lock:
+        if closing:
+            return
+        closing = True
 
-    closing = True
-    active.clear()
-
-    if dns_socket:
-        try:
-            dns_socket.close()
-        except Exception:
-            pass
-
-    if server:
-        threading.Thread(
-            target=lambda: (server.shutdown(), server.server_close()),
-            daemon=True
-        ).start()
-
+    stop_services()
     stop_hotspot()
     root.destroy()
 
@@ -366,35 +524,27 @@ root = tk.Tk()
 root.title("LocalNet command line")
 root.geometry("780x500")
 
-output = ScrolledText(root, state="disabled", font=("Consolas", 10))
+output = ScrolledText(
+    root,
+    state="disabled",
+    font=("Consolas", 10)
+)
 output.pack(fill="both", expand=True, padx=8, pady=8)
 
 entry = tk.Entry(root, font=("Consolas", 11))
 entry.pack(fill="x", padx=8, pady=(0, 8))
 entry.bind("<Return>", submit)
+entry.focus_set()
 
 root.protocol("WM_DELETE_WINDOW", close_app)
 
-log("LocalNet starting...")
+log("LocalNet command line ready.")
 log(f"Domains folder: {DOMAINS}")
+log("No web server or hotspot started automatically.")
+log("Type help to see commands.")
 
 if not DOMAINS.is_dir():
-    log("ERROR: Create a Domains folder beside LocalNet.py.")
+    log("WARNING: Create a Domains folder beside LocalNet.py.")
 
-if not admin():
-    log("WARNING: Not running as Administrator.")
-    log("DNS port 53 and hotspot startup may fail.")
-
-start_web()
-
-dns_thread = threading.Thread(target=dns_loop, daemon=True)
-dns_thread.start()
-
-if admin():
-    start_hotspot()
-else:
-    log("Open LocalNet as Administrator to attempt hotspot startup.")
-
-log("Type help for commands.")
 update_log()
 root.mainloop()
